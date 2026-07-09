@@ -1,0 +1,19 @@
+# Secrets -- .env holds a real GOOGLE_API_KEY once filled in; .env.example is the template
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+
+# RAG index -- build artifact of `make ingest`, regenerable, provider-specific
+# (a Gemini-embedded index isn't compatible with a local/OpenAI one)
+data/guidelines_index/
+
+# OS cruft
+.DS_Store
