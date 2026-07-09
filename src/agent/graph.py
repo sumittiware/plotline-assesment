@@ -15,12 +15,30 @@ Node responsibilities:
          see resilience.py for why). Whatever comes out of that (success or
          a still-failing exception) is caught into a structured
          {"error": ...} result so a bad call surfaces to the LLM, which can
-         adapt, rather than crashing the whole run.
-- fallback: reached either when steps_taken hits MAX_AGENT_STEPS, or when the
-            LLM call exhausts its retries (llm_failed). Ends the run with a
-            clearly-flagged degraded response -- a small deterministic
-            template, NOT a second LLM call -- built from the last
-            successfully-resolved segment if one exists.
+         adapt, rather than crashing the whole run. Repeated identical calls
+         to a pure-read tool (MEMOIZABLE_TOOLS: query_segment,
+         search_guidelines) are memoized per-run -- a confused/looping LLM
+         re-issuing the exact same query doesn't cost a second DB/FAISS round
+         trip. create_campaign is deliberately never memoized (see its
+         comment) since it writes and its args get mutated in-flight.
+- fallback: reached when steps_taken hits MAX_AGENT_STEPS, when the LLM call
+            exhausts its retries (llm_failed), or when loop_detected fires
+            (see below). Ends the run with a clearly-flagged degraded
+            response -- a small deterministic template, NOT a second LLM
+            call -- built from the last successfully-resolved segment if one
+            exists.
+
+Loop detection: memoizing a repeat call (above) only cheapens the *tool*
+side of a repeat -- the LLM turn that produced it still costs a real API
+call, and the tools->agent edge is unconditional, so that alone wouldn't stop
+a confused LLM from looping until MAX_AGENT_STEPS. call_model checks the
+*proposed* tool_calls against tool_call_cache the instant they come back from
+the LLM (_is_fully_redundant_tool_batch): if every call in this turn is an
+exact repeat of one already cached, that turn gained zero new information, so
+loop_detected is set right there and should_continue routes straight to
+fallback -- skipping both the pointless tool dispatch AND any further LLM
+turns, rather than paying for several more rounds before the step budget
+catches it.
 
 Compliance override (DESIGN.md SS5.4): create_campaign calls targeting an
 external channel (push/email) always get the top consent-compliance chunk
@@ -82,6 +100,37 @@ class CopilotState(TypedDict):
     forced_idempotency_key: Optional[str]
     llm_failed: bool
     run_id: str
+    tool_call_cache: Dict[str, Any]
+    loop_detected: bool
+
+
+# Tools safe to memoize within a single run: pure reads, no side effects, same
+# args always produce the same result against a fixed snapshot of the DB/index
+# for the run's duration. create_campaign is deliberately excluded -- it has a
+# side effect (a write) and its own args get mutated in-flight (forced
+# compliance citation, client idempotency key override) before dispatch, so
+# short-circuiting it here would risk bypassing that logic rather than saving
+# real work (its repeat-call cost is already bounded by the idempotency
+# unique-constraint fast path).
+MEMOIZABLE_TOOLS = {"query_segment", "search_guidelines"}
+
+
+def _tool_call_cache_key(tool_name: str, args: dict) -> str:
+    return f"{tool_name}:{json.dumps(args, sort_keys=True, default=str)}"
+
+
+def _is_fully_redundant_tool_batch(tool_calls: List[dict], cache: Dict[str, Any]) -> bool:
+    """
+    True only when EVERY tool_call the LLM just proposed is an exact repeat of
+    something already in the cache -- i.e. this turn would add zero new
+    information if dispatched. A mixed batch (one new call + one repeat)
+    still returns False here and goes through the normal tools node, where
+    the repeat is served from cache but the new call still runs for real.
+    """
+    return bool(tool_calls) and all(
+        tc["name"] in MEMOIZABLE_TOOLS and _tool_call_cache_key(tc["name"], tc["args"]) in cache
+        for tc in tool_calls
+    )
 
 
 def _summarize(result: Any) -> str:
@@ -239,6 +288,18 @@ def build_graph(llm: Union[MockLLMClient, Any], tools: List[StructuredTool]):
                 "tool_calls": [tc["name"] for tc in (response.tool_calls or [])],
             }
         )
+
+        if _is_fully_redundant_tool_batch(response.tool_calls or [], state["tool_call_cache"]):
+            # The LLM just proposed a batch where every call is an exact
+            # repeat of one it already has the result for -- dispatching it
+            # would teach it nothing new. Flag this NOW (this node just paid
+            # for the one real LLM call that produced the redundant proposal)
+            # so should_continue routes straight to fallback -- skipping both
+            # the pointless tool dispatch AND any further LLM turns, rather
+            # than only cheapening the repeat and still looping until
+            # MAX_AGENT_STEPS.
+            state["loop_detected"] = True
+
         return state
 
     def call_tools(state: CopilotState) -> CopilotState:
@@ -246,6 +307,31 @@ def build_graph(llm: Union[MockLLMClient, Any], tools: List[StructuredTool]):
         for tool_call in last.tool_calls:
             args = tool_call["args"]
             grounding_error = None
+            cache_key = None
+
+            if tool_call["name"] in MEMOIZABLE_TOOLS:
+                cache_key = _tool_call_cache_key(tool_call["name"], args)
+                if cache_key in state["tool_call_cache"]:
+                    # A confused/looping LLM re-issuing the exact same read
+                    # shouldn't cost a second DB/FAISS round trip AND a step
+                    # of the budget -- reuse the prior result verbatim.
+                    result = state["tool_call_cache"][cache_key]
+                    state["trace"].append(
+                        {
+                            "tool": tool_call["name"],
+                            "input": args,
+                            "result_summary": _summarize(result),
+                            "cache_hit": True,
+                        }
+                    )
+                    state["messages"].append(
+                        ToolMessage(
+                            content=json.dumps(result, default=str),
+                            tool_call_id=tool_call["id"],
+                            name=tool_call["name"],
+                        )
+                    )
+                    continue
 
             if tool_call["name"] == "create_campaign":
                 args = _ensure_compliance_citation(args, tools_by_name, state["trace"], state["messages"])
@@ -263,6 +349,8 @@ def build_graph(llm: Union[MockLLMClient, Any], tools: List[StructuredTool]):
                 result = {"error": grounding_error}
             else:
                 result = _dispatch_tool({"name": tool_call["name"], "args": args}, tools_by_name)
+                if cache_key is not None:
+                    state["tool_call_cache"][cache_key] = result
 
             state["trace"].append(
                 {
@@ -289,7 +377,12 @@ def build_graph(llm: Union[MockLLMClient, Any], tools: List[StructuredTool]):
         gets something concrete rather than a bare apology.
         """
         state["degraded"] = True
-        reason = "llm_provider_failure" if state.get("llm_failed") else "max_steps_exceeded"
+        if state.get("llm_failed"):
+            reason = "llm_provider_failure"
+        elif state.get("loop_detected"):
+            reason = "repeated_tool_call_detected"
+        else:
+            reason = "max_steps_exceeded"
         segment = last_tool_result(state["messages"], "query_segment")
 
         if segment and "error" not in segment:
@@ -314,6 +407,8 @@ def build_graph(llm: Union[MockLLMClient, Any], tools: List[StructuredTool]):
 
     def should_continue(state: CopilotState) -> str:
         if state.get("llm_failed"):
+            return "fallback"
+        if state.get("loop_detected"):
             return "fallback"
         if state["steps_taken"] >= MAX_AGENT_STEPS:
             return "fallback"
@@ -350,6 +445,8 @@ def run(
         "forced_idempotency_key": idempotency_key,
         "llm_failed": False,
         "run_id": run_id,
+        "tool_call_cache": {},
+        "loop_detected": False,
     }
     # run_name/tags/metadata are LangSmith-facing (inert if tracing isn't
     # enabled) -- run_name carries our own run_id so a trace, if one exists,

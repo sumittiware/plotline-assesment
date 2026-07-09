@@ -93,9 +93,12 @@ def test_full_happy_path_creates_campaign_and_ends(tools):
 
 def test_step_budget_exceeded_routes_to_fallback_instead_of_looping_forever(tools):
     # Script more tool-call turns than MAX_AGENT_STEPS allows, and never end --
-    # should_continue must cut the loop rather than let it run away.
+    # should_continue must cut the loop rather than let it run away. Each call
+    # uses a genuinely distinct query so this exercises the step-budget
+    # backstop in isolation, not loop detection (identical repeats would be
+    # caught earlier by that instead -- see the dedicated loop-detection tests).
     responses = [
-        _tool_call_message("search_guidelines", {"query": "brand voice"}, str(i))
+        _tool_call_message("search_guidelines", {"query": f"brand voice {i}"}, str(i))
         for i in range(MAX_AGENT_STEPS + 3)
     ]
     final_state = run("Some goal", MockLLMClient(responses), tools)
@@ -123,6 +126,96 @@ def test_tool_exception_becomes_structured_error_not_a_crash(tools):
     assert len(tool_messages) == 1
     assert "error" in tool_messages[0].content.lower()
     assert final_state["degraded"] is False
+
+
+def test_repeated_identical_query_segment_call_triggers_early_fallback(tools):
+    # A confused LLM re-issuing the exact same read gains zero new
+    # information -- should_continue must catch this the moment the LLM
+    # proposes the repeat and route straight to fallback, WITHOUT dispatching
+    # the redundant tool call again and WITHOUT paying for a further LLM turn
+    # (only 2 responses are scripted here; if the graph asked for a 3rd,
+    # MockLLMClient would raise IndexError, i.e. this test also proves no
+    # extra LLM call happens).
+    responses = [
+        _tool_call_message("query_segment", {"inactive_days_min": 14}, "1"),
+        _tool_call_message("query_segment", {"inactive_days_min": 14}, "2"),  # identical repeat
+    ]
+    final_state = run("Some goal", MockLLMClient(responses), tools)
+
+    assert final_state["degraded"] is True
+    assert final_state["steps_taken"] == 1  # only turn 1's real dispatch -- turn 2 never reached the tools node
+    fallback_entries = [t for t in final_state["trace"] if t.get("type") == "fallback"]
+    assert len(fallback_entries) == 1
+    assert fallback_entries[0]["reason"] == "repeated_tool_call_detected"
+
+    segment_entries = [t for t in final_state["trace"] if t.get("tool") == "query_segment"]
+    assert len(segment_entries) == 1  # the repeat never reached call_tools, so no second entry at all
+    assert "cache_hit" not in segment_entries[0]
+
+
+def test_mixed_batch_with_one_new_and_one_repeated_call_still_dispatches_the_new_one(tools):
+    # A batch isn't "fully redundant" (and shouldn't early-fallback) if it
+    # mixes a genuine repeat with a call that IS new -- the repeat is served
+    # from cache, but the new one still runs for real via the normal tools node.
+    first_call = _tool_call_message("query_segment", {"inactive_days_min": 14}, "1")
+    mixed_batch = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "query_segment", "args": {"inactive_days_min": 14}, "id": "2a"},  # repeat
+            {"name": "query_segment", "args": {"inactive_days_min": 30}, "id": "2b"},  # new
+        ],
+    )
+    responses = [first_call, mixed_batch, AIMessage(content="Done.")]
+    final_state = run("Some goal", MockLLMClient(responses), tools)
+
+    assert final_state["degraded"] is False
+    segment_entries = [t for t in final_state["trace"] if t.get("tool") == "query_segment"]
+    assert len(segment_entries) == 3  # turn 1's real call + turn 2's cache hit + turn 2's new real call
+    assert "cache_hit" not in segment_entries[0]
+    assert segment_entries[1]["cache_hit"] is True
+    assert "cache_hit" not in segment_entries[2]
+
+
+def test_query_segment_call_with_different_args_is_not_memoized(tools):
+    responses = [
+        _tool_call_message("query_segment", {"inactive_days_min": 14}, "1"),
+        _tool_call_message("query_segment", {"inactive_days_min": 30}, "2"),  # different args
+        AIMessage(content="Done."),
+    ]
+    final_state = run("Some goal", MockLLMClient(responses), tools)
+
+    segment_entries = [t for t in final_state["trace"] if t.get("tool") == "query_segment"]
+    assert len(segment_entries) == 2
+    assert "cache_hit" not in segment_entries[0]
+    assert "cache_hit" not in segment_entries[1]
+
+
+def test_create_campaign_is_never_memoized_even_with_identical_repeated_args(tools):
+    # create_campaign is deliberately excluded from memoization (it writes,
+    # and its args get mutated in-flight by the compliance-citation/
+    # idempotency-key overrides) -- a repeat call must still go through the
+    # real dispatch path (and hit the idempotency fast path), never a cache_hit.
+    segment_call = _tool_call_message("query_segment", {"inactive_days_min": 14}, "0")
+    payload = {
+        "goal_text": "win back dormant users",
+        "segment_def": {"inactive_days_min": 14},
+        "segment_size": 0,
+        "channel": "email",
+        "message_copy": "come back!",
+        "guideline_citations": [],
+    }
+    responses = [
+        segment_call,
+        _tool_call_message("create_campaign", payload, "1"),
+        _tool_call_message("create_campaign", payload, "2"),  # identical repeat
+        AIMessage(content="Done."),
+    ]
+    final_state = run("Win back dormant users", MockLLMClient(responses), tools)
+
+    campaign_entries = [t for t in final_state["trace"] if t.get("tool") == "create_campaign"]
+    assert len(campaign_entries) == 2
+    assert "cache_hit" not in campaign_entries[0]
+    assert "cache_hit" not in campaign_entries[1]
 
 
 def test_create_campaign_for_push_channel_auto_cites_compliance_doc_even_if_llm_did_not(tools):
