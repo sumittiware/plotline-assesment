@@ -40,7 +40,7 @@ curl localhost:8000/copilot/run/run_<the-run_id-from-above>
 ```
 
 ```bash
-make test                      # 87 tests, no API key needed, ~1.5s
+make test                      # 98 tests, no API key needed, ~1.5s
 ```
 
 That's the whole path from clone to a running Copilot with only this README and your own Gemini key. No Docker, no external services — SQLite and FAISS are both embedded/in-process.
@@ -183,6 +183,7 @@ This checks the **structured tool arguments**, not the free-text final answer �
   - **LLM calls** retry on *any* exception. Classifying "retryable" would mean importing a specific provider's exception types, which this module deliberately avoids to stay provider-agnostic.
 - **Circuit breaker**: if the LLM still fails after exhausting retries, the graph doesn't crash — it routes to a `fallback` node (the same one used when the step budget is exceeded) that produces a **small, deterministic templated response** — *not* a second LLM call — built from the last successfully-resolved segment, if any, per "use the raw filters the last successful tool call resolved."
 - **Step budget** (`MAX_AGENT_STEPS`, default 6) is the primary cost/latency backstop against a runaway loop, independent of the above.
+- **Loop detection**: the step budget alone is a blunt backstop — a confused LLM could still burn several real LLM turns repeating an identical `query_segment`/`search_guidelines` call (gaining zero new information each time) before hitting it. Two complementary mechanisms in [src/agent/graph.py](src/agent/graph.py): (1) identical repeat calls to a pure-read tool are memoized per-run, so a repeat never costs a second DB/FAISS round trip (real $ savings for `search_guidelines`, which calls the embedding API); (2) the moment the LLM *proposes* a batch where every call is an exact repeat of one already cached, that's flagged immediately and routed straight to the `fallback` node — skipping both the pointless dispatch and any further LLM turns, rather than only cheapening the repeat and still looping until `MAX_AGENT_STEPS`. `create_campaign` is deliberately excluded from both (it writes, and its args get mutated in-flight by the compliance/idempotency overrides — its repeat-call cost is already bounded by the idempotency fast path).
 
 This isn't hypothetical: it was **verified against the real Gemini API's free-tier rate limit** mid-development. A live run hit a genuine `429 ResourceExhausted`, retried, exhausted retries, and degraded gracefully — HTTP 200 throughout, never a 500 — even correctly reusing an already-completed `create_campaign` result from earlier in that same run via the idempotency mechanism, instead of a bare apology.
 
@@ -217,7 +218,7 @@ This isn't hypothetical: it was **verified against the real Gemini API's free-ti
 ## Testing
 
 ```bash
-make test          # 87 tests (+ 8 opt-in live ones skipped by default), ~1.5s, zero network/API dependency
+make test          # 98 tests (+ 8 opt-in live ones skipped by default), ~1.5s, zero network/API dependency
 ```
 
 | File | Covers |
@@ -277,9 +278,9 @@ campaign-copilot/
 │   │   ├── llm_client.py        # real ChatGoogleGenerativeAI + MockLLMClient, shared interface
 │   │   └── prompts.py           # loads prompts.yaml
 │   ├── tools/
-│   │   ├── query_segment.py     # plain function + pydantic filter DSL
-│   │   ├── search_guidelines.py # plain function, wraps the FAISS retriever
-│   │   ├── create_campaign.py   # plain function, idempotent write
+│   │   ├── query_segment.py     # LLM-facing schema + orchestration; raw SQL lives in data_access/segments.py
+│   │   ├── search_guidelines.py # LLM-facing schema; wraps rag/index.py's FAISS retriever
+│   │   ├── create_campaign.py   # LLM-facing schema + idempotency/transaction control; raw SQL in data_access/campaigns.py
 │   │   └── registry.py          # wraps the three as LangChain StructuredTools (only file that imports LangChain into tools/)
 │   ├── rag/
 │   │   ├── ingest.py            # chunk → embed → index, `python -m src.rag.ingest`
@@ -287,10 +288,13 @@ campaign-copilot/
 │   │   └── embeddings.py        # pluggable embedding backend (gemini/openai/local)
 │   ├── data_access/
 │   │   ├── schema.sql
-│   │   └── db.py                 # connection + derived-table rebuild, `python -m src.data_access.db`
+│   │   ├── db.py                 # connection + derived-table rebuild, `python -m src.data_access.db`
+│   │   ├── campaigns.py          # raw SQL for campaigns + campaign_segment_members
+│   │   ├── segments.py           # raw SQL for resolving a segment from user_activity_summary
+│   │   └── runs.py               # raw SQL for the async-job `runs` table
 │   └── observability/
 │       └── logging.py            # structured JSON-lines logging
-└── tests/                       # 87 tests + 8 opt-in live ones — see Testing/Eval approach above
+└── tests/                       # 98 tests + 8 opt-in live ones — see Testing/Eval approach above
     └── fixtures/golden_set.py    # the eval harness's golden-set goals + expected properties
 ```
 
